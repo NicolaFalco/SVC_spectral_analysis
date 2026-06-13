@@ -1,0 +1,40 @@
+# ── Hierarchical column structure ──────────────────────────────────────────────
+# Define the grouping hierarchy from coarsest (level1) to finest (level3).
+# The actual column names must match your stacked_metadata.csv headers.
+#
+# Example:
+#   level1: Species       (root/parent group — e.g. Species, Genotype, Site)
+#   level2: Plant         (individual — e.g. Plant, Sample, Subject, Tree)
+#   level3: Treatment     (most granular — e.g. Treatment, Condition, Dose)
+#
+# Time is parsed automatically from the scan name (YYYYMMDD_scannumber format).
+
+hierarchy:
+  level1:   species       # coarsest grouping (parent)
+  level2:   plant_id         # individual/replicate
+  level3:   treatment     # finest grouping (most granular)
+
+scan:
+  id_col:   Spec_scan     # unique scan identifier column
+  date_col: Datetime          # date column (parsed from scan name by stack.py)
+
+# ── PLS-DA ─────────────────────────────────────────────────────────────────────
+plsda:
+  cv:            stratified    # stratified | loo
+  n_folds:       5
+  n_iter_search: 20
+  random_state:  42
+
+# ── Trajectory ─────────────────────────────────────────────────────────────────
+trajectory:
+  n_components: 10
+
+# ── Difference spectra ─────────────────────────────────────────────────────────
+diff_spectra:                  # reserved for future parameters
+
+# ── Plots ──────────────────────────────────────────────────────────────────────
+plots:
+  dpi:       150
+  palette:   tab10
+  cmap:      Blues
+  vip_top_n: 20

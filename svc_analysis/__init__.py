@@ -1,2 +1,4 @@
-from .pca import load_and_average, run_pca
-from .plots import plot_scores, plot_explained_variance
+# svc_analysis/__init__.py
+"""Hyperspectral PLS-DA analysis pipeline."""
+
+__version__ = "1.0.0"

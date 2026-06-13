@@ -1,108 +1,194 @@
 """
-SVC Analysis — PCA on averaged spectral signatures
-====================================================
-
-Usage:
-    svc-analysis --input data.csv --class-col species --gr plant
-
-Options:
-    --input       Path to the input CSV file (required)
-    --class-col   Column name for class labels, e.g. species, label (required)
-    --gr          Column name to group/average by, e.g. plant, plot (required)
-    --n-pcs       Number of PCA components to compute (default: 10)
-    --n-std       Confidence ellipse radius in std deviations (default: 2.0 → ~95%)
-    --title       Title prefix added to figure filenames and plot titles (optional)
-
-Examples:
-    # Default settings (2.0 std ellipse, 10 PCs)
-    svc-analysis --input data.csv --class-col species --gr plant
-
-    # With a custom title
-    svc-analysis --input data.csv --class-col species --gr plant --title Experiment_01
-
-    # Tighter ellipse (1 std → ~39% confidence)
-    svc-analysis --input data.csv --class-col species --gr plant --n-std 1.0
-
-    # Wider ellipse (3 std → ~99% confidence)
-    svc-analysis --input data.csv --class-col species --gr plant --n-std 3.0
-
-    # Compute more PCs
-    svc-analysis --input data.csv --class-col species --gr plant --n-pcs 20
-
-Output:
-    Figures are saved to: svc_output/figures/
-        - {title}_pca_PC1_vs_PC2.png       (or pca_PC1_vs_PC2.png if no title)
-        - {title}_pca_PC1_vs_PC3.png
-        - {title}_pca_explained_variance.png
+svc_analysis/__main__.py
+========================
+Full orchestrator for the hyperspectral analysis pipeline.
 """
 
+from __future__ import annotations
+
 import argparse
-import sys
-from .pca import load_and_average, run_pca
-from .plots import plot_scores, plot_explained_variance
+import importlib.resources as pkg_resources
+import logging
+from pathlib import Path
 
+import pandas as pd
+import yaml
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="SVC Spectral Analysis — PCA on averaged spectral signatures",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+# Import analytical modules
+from .pca import run_pca
+from .plsda import run_plsda
+from .trajectory import compute_trajectories
+from .diff_spectra import compute_diff_spectra
+
+# Import plotting modules
+from .plots import (
+    plot_mean_spectra,
+    plot_confusion_matrices,
+    plot_vip_scores,
+    plot_f1_over_dates,
+    plot_metrics_heatmap,
+    plot_pca_scores,
+    plot_trajectory_centroids,
+    plot_trajectory,
+)
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level  = logging.INFO,
+    format = '%(asctime)s  %(levelname)-8s  %(message)s',
+    datefmt= '%H:%M:%S',
+)
+log = logging.getLogger(__name__)
+
+# ── Config helpers ─────────────────────────────────────────────────────────────
+
+def _default_config_path() -> Path:
+    with pkg_resources.path('svc_analysis', 'config.yaml') as p:
+        return Path(p)
+
+def _load_config(path: str | Path | None = None) -> dict:
+    if path is None:
+        path = _default_config_path()
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    log.info('Config loaded from %s', path)
+    return cfg
+
+def _validate_config(cfg: dict) -> None:
+    required = ['hierarchy.level1', 'hierarchy.level2', 'hierarchy.level3', 'scan.id_col', 'scan.date_col']
+    for key in required:
+        parts = key.split('.')
+        node = cfg
+        for p in parts:
+            if not isinstance(node, dict) or p not in node:
+                raise KeyError(f'Missing required config key: {key}')
+            node = node[p]
+
+def _get_cols(cfg: dict) -> dict:
+    return {
+        'level1':   cfg['hierarchy']['level1'],
+        'level2':   cfg['hierarchy']['level2'],
+        'level3':   cfg['hierarchy']['level3'],
+        'scan_id':  cfg['scan']['id_col'],
+        'date':     cfg['scan']['date_col'],
+    }
+
+# ── Pipeline ───────────────────────────────────────────────────────────────────
+
+def run_pipeline(cfg: dict) -> None:
+    output_dir = Path(cfg['output_dir'])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    title = cfg.get('title', 'analysis')
+    cols  = _get_cols(cfg)
+    plot_cfg = cfg.get('plots', {})
+
+    # 1. Load Data
+    log.info('Loading spectra and metadata...')
+    spectra_df = pd.read_csv(cfg['spectra_path'])
+    metadata_df = pd.read_csv(cfg['metadata_path'])
+
+    # 2. PCA Analysis (Per-day & Global)
+    log.info('Running PCA analysis...')
+    pca_results = run_pca(
+        spectra_df = spectra_df,
+        metadata_df = metadata_df,
+        cols = cols,
+        output_dir = output_dir,
+        n_components = cfg.get('trajectory', {}).get('n_components', 10)
     )
-    parser.add_argument("--input",     required=True,  help="Path to input CSV file")
-    parser.add_argument("--class-col", required=True,  help="Column name for class labels (e.g. species, label)")
-    parser.add_argument("--gr",        required=True,  help="Column name to group/average by (e.g. plant, plot)")
-    parser.add_argument("--n-pcs",     type=int,   default=10,  help="Number of PCA components to compute (default: 10)")
-    parser.add_argument("--n-std",     type=float, default=2.0, help="Confidence ellipse radius in std deviations (default: 2.0 → ~95%%)")
-    parser.add_argument("--title",     default=None,             help="Title prefix added to figure filenames and plot titles (optional)")
 
-    args = parser.parse_args()
+    # 3. PLS-DA Classification
+    log.info('Running PLS-DA classification...')
+    pls_cfg = cfg.get('plsda', {})
+    pls_results = run_plsda(
+        spectra_df = spectra_df,
+        metadata_df = metadata_df,
+        cols = cols,
+        output_dir = output_dir,
+        cv = pls_cfg.get('cv', 'stratified'),
+        n_folds = pls_cfg.get('n_folds', 5),
+        n_iter_search = pls_cfg.get('n_iter_search', 20),
+        random_state = pls_cfg.get('random_state', 42),
+    )
 
-    print(f"\n── SVC Analysis ──────────────────────────────────────")
-    print(f"  Input file : {args.input}")
-    print(f"  Class col  : {args.class_col}")
-    print(f"  Group col  : {args.gr}")
-    print(f"  Ellipse    : {args.n_std} std ({_std_to_confidence(args.n_std):.0f}% confidence)")
-    print(f"  Title      : {args.title if args.title else 'None'}")
-    print(f"──────────────────────────────────────────────────────\n")
+    # 4. Trajectory Calculation
+    log.info('Computing trajectories...')
+    traj_results = compute_trajectories(
+        spectra_df = spectra_df,
+        metadata_df = metadata_df,
+        cols = cols,
+        output_dir = output_dir,
+        n_components = cfg.get('trajectory', {}).get('n_components', 10)
+    )
 
-    # ── Load and average ───────────────────────────────────────────────────────
-    print("→ Loading and averaging spectra by group...")
-    try:
-        averaged_df = load_and_average(args.input, args.gr, args.class_col)
-    except ValueError as e:
-        print(f"\n[Error] {e}")
-        sys.exit(1)
+    # 5. Difference Spectra
+    log.info('Computing difference spectra...')
+    compute_diff_spectra(
+        spectra_df = spectra_df,
+        metadata_df = metadata_df,
+        cols = cols,
+        output_dir = output_dir
+    )
 
-    print(f"  Groups found  : {len(averaged_df)}")
-    print(f"  Classes found : {sorted(averaged_df[args.class_col].unique())}\n")
+    # 6. Plotting
+    log.info('Generating final figures...')
+    
+    # General spectra
+    plot_mean_spectra(spectra_df, metadata_df, cols, output_dir, title=title, **plot_cfg)
 
-    # ── Run PCA ───────────────────────────────────────────────────────────────
-    print("→ Running PCA...")
-    try:
-        scores_df, explained_variance, pca = run_pca(
-            averaged_df, args.class_col, args.gr, n_components=args.n_pcs
-        )
-    except ValueError as e:
-        print(f"\n[Error] {e}")
-        sys.exit(1)
+    # PCA-based plots
+    plot_pca_scores(pca_results, output_dir, cols, title=title, **plot_cfg)
 
-    for i, var in enumerate(explained_variance):
-        print(f"  PC{i+1}: {var*100:.2f}%")
+    # PLS-DA based plots
+    plot_confusion_matrices(pls_results, output_dir, title=title, **plot_cfg)
+    plot_vip_scores(pls_results, output_dir, title=title, **plot_cfg)
+    plot_f1_over_dates(pls_results, output_dir, title=title, **plot_cfg)
+    plot_metrics_heatmap(pls_results, output_dir, title=title, **plot_cfg)
 
-    # ── Generate plots ─────────────────────────────────────────────────────────
-    print("\n→ Saving figures...")
-    plot_scores(scores_df, args.class_col, "PC1", "PC2", explained_variance, n_std=args.n_std, title=args.title)
-    plot_scores(scores_df, args.class_col, "PC1", "PC3", explained_variance, n_std=args.n_std, title=args.title)
-    plot_explained_variance(explained_variance, title=args.title)
+    # Trajectory based plots
+    # NOTE: These expect the consolidated results from trajectory.py
+    plot_trajectory_centroids(traj_results, output_dir, cols, title=title, **plot_cfg)
+    plot_trajectory(traj_results, output_dir, cols, title=title, **plot_cfg)
 
-    print("\n✅ Done!")
+    # 7. Final Metrics Summary
+    all_metrics = []
+    for l1, dates in pls_results.items():
+        for date, res in dates.items():
+            all_metrics.append(res['metrics_df'])
 
+    if all_metrics:
+        combined = pd.concat(all_metrics, ignore_index=True)
+        combined.to_csv(output_dir / f'{title}_all_metrics.csv', index=False)
+        summary = combined.groupby(['level1', 'date'])[['f1', 'precision', 'recall']].agg(['mean', 'std']).round(3)
+        print('\n── PLS-DA Summary ──────────────────────────────────────────────────')
+        print(summary.to_string())
+        print()
 
-def _std_to_confidence(n_std: float) -> float:
-    """Convert number of standard deviations to approximate confidence percentage."""
-    from scipy.stats import chi2
-    return chi2.cdf(n_std ** 2, df=2) * 100
+    log.info('Pipeline complete. All outputs saved to: %s', output_dir)
 
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(description='Run the hyperspectral analysis pipeline.')
+    parser.add_argument('--input-folder', '-i', required=True, help='Path to folder with CSVs')
+    parser.add_argument('--output-dir', '-o', default=None, help='Output directory')
+    parser.add_argument('--title', '-t', default=None, help='Base name for files')
+    parser.add_argument('--config', '-c', default=None, help='Path to YAML config')
+    return parser.parse_args(argv)
+
+def main(argv=None):
+    args = _parse_args(argv)
+    cfg = _load_config(args.config)
+    _validate_config(cfg)
+
+    input_folder = Path(args.input_folder).resolve()
+    cfg['spectra_path']  = input_folder / 'stacked_spectra.csv'
+    cfg['metadata_path'] = input_folder / 'stacked_metadata.csv'
+    cfg['output_dir'] = Path(args.output_dir).resolve() if args.output_dir else input_folder
+    cfg['title'] = args.title or input_folder.name
+
+    run_pipeline(cfg)
+
+if __name__ == '__main__':
     main()
