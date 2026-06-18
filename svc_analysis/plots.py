@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 import numpy as np
 import pandas as pd
 
@@ -29,7 +30,10 @@ def _wavelengths(cols: list[str]) -> np.ndarray:
 
 
 def _safe_stem(l1: str, date: str) -> str:
-    return f'{str(l1).replace(" ", "_")}_{str(date).replace("-", "")}'
+    """Clean strings to be used as filenames (removes spaces, slashes, colons)."""
+    s_l1 = str(l1).replace(' ', '_').replace('/', '_').replace('\\', '_').replace(':', '_')
+    s_date = str(date).replace(' ', '_').replace('/', '_').replace('\\', '_').replace(':', '_').replace('-', '')
+    return f'{s_l1}_{s_date}'
 
 
 def _palette(name: str, n: int) -> list:
@@ -44,37 +48,104 @@ def _save(fig: plt.Figure, path: Path, dpi: int = 150) -> None:
     log.info('Saved: %s', path)
 
 
+
+def draw_ellipse(ax, x, y, confidence: float = 0.95) -> None:
+    """
+    Draw a confidence ellipse around a cloud of points.
+
+    Parameters
+    ----------
+    ax   : matplotlib.axes.Axes
+        Axis on which to draw the ellipse.
+    x, y : array‑like
+        Coordinates of the points belonging to one class/treatment.
+    confidence : float, optional
+        Desired confidence level (default 0.95).
+
+    Notes
+    -----
+    The ellipse is based on the covariance matrix of (x, y).
+    For a bivariate normal distribution the chi‑square value for 95 % confidence
+    is 5.991 (df=2). The scaling factor is therefore
+        scale = sqrt( chi2.ppf(confidence, df=2) )
+    """
+    # Need at least 3 points to estimate a covariance matrix
+    if len(x) < 3:
+        return
+
+    # ----- 1. Covariance matrix & eigen‑decomposition -----
+    cov = np.cov(x, y)                     # 2 × 2 matrix
+    eigvals, eigvecs = np.linalg.eig(cov)   # eigvals = λ1, λ2 ; eigvecs columns are eigenvectors
+
+    # ----- 2. Sort eigenvalues (largest first) -----
+    order = eigvals.argsort()[::-1]          # descending order
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+
+    # ----- 3. Lengths of the ellipse axes -----
+    # For a 2‑D Gaussian the chi‑square value for the requested confidence is:
+    #   chi2 = scipy.stats.chi2.ppf(confidence, df=2)
+    # We avoid pulling in scipy by using the constant for 95 % (≈5.991).
+    chi2_val = {0.95: 5.991, 0.99: 9.210, 0.90: 4.605}.get(confidence, 5.991)
+    # Axis lengths are sqrt(λ * chi2)
+    width  = 2 * np.sqrt(eigvals[0] * chi2_val)   # major axis
+    height = 2 * np.sqrt(eigvals[1] * chi2_val)   # minor axis
+
+    # ----- 4. Rotation angle -----
+    # The eigenvector corresponding to the largest eigenvalue points along the
+    # major axis.  The angle between that vector and the x‑axis gives the rotation.
+    angle = np.degrees(np.arctan2(eigvecs[1, 0], eigvecs[0, 0]))
+
+    # ----- 5. Draw the ellipse -----
+    ellipse = Ellipse(
+        xy      = (np.mean(x), np.mean(y)),
+        width   = width,
+        height  = height,
+        angle   = angle,
+        edgecolor = 'black',
+        facecolor = 'none',
+        lw      = 1.2,
+        alpha   = 0.6,
+    )
+    ax.add_patch(ellipse)
+
 # ── 1. Mean spectra ────────────────────────────────────────────────────────────
 
 def plot_mean_spectra(
-    spectra_df:  pd.DataFrame,
-    metadata_df: pd.DataFrame,
-    cols:        dict,
-    output_dir:  str | Path,
-    title:       str = 'analysis',
-    dpi:         int = 150,
-    palette:     str = 'tab10',
-    figsize:     tuple = (10, 4),
+    spectra_df:   pd.DataFrame,
+    metadata_df:  pd.DataFrame,
+    cols:         dict,
+    output_dir:   str | Path,
+    title:        str = 'analysis',
+    dpi:          int = 150,
+    palette:      str = 'tab10',
+    figsize:      tuple = (10, 4),
 ) -> None:
     """
-    Plot mean ± std spectra grouped by level3 (treatment),
-    one subplot per level1 (species/parent), one figure per date.
+    Plot the **average spectrum of each plant (level2) per day**,
+    coloured by treatment (level3). One subplot per species, one figure per day.
     """
     output_dir = Path(output_dir)
     scan_col   = cols['scan_id']
     l1_col     = cols['level1']
+    l2_col     = cols['level2']
     l3_col     = cols['level3']
     date_col   = cols['date']
 
-    merged  = spectra_df.merge(metadata_df, on=scan_col, how='inner')
-    scols   = _spec_cols(merged)
-    wl      = _wavelengths(scols)
+    # -------------------------------------------------------------
+    # Merge the *aggregated* spectra with the metadata (they already share scan_id)
+    # -------------------------------------------------------------
+    merged = spectra_df.merge(metadata_df, on=scan_col, how='inner')
+    spec_cols = _spec_cols(merged)                # w_…
+    wavelengths = _wavelengths(spec_cols)
+
     l1_vals = sorted(merged[l1_col].unique())
     dates   = sorted(merged[date_col].unique())
 
     for date in dates:
-        dg    = merged[merged[date_col] == date]
-        n_l1  = len(l1_vals)
+        day_df = merged[merged[date_col] == date]
+
+        n_l1 = len(l1_vals)
         fig, axes = plt.subplots(
             1, n_l1,
             figsize=(figsize[0] * n_l1, figsize[1]),
@@ -86,27 +157,46 @@ def plot_mean_spectra(
         fig.suptitle(f'{title}  |  {date}', fontsize=13)
 
         for ax, l1 in zip(axes, l1_vals):
-            sub    = dg[dg[l1_col] == l1]
-            groups = sorted(sub[l3_col].unique())
-            colors = _palette(palette, len(groups))
+            sub = day_df[day_df[l1_col] == l1]
 
-            for color, grp in zip(colors, groups):
-                gdata = sub[sub[l3_col] == grp][scols].values.astype(float)
-                mean  = gdata.mean(axis=0)
-                std   = gdata.std(axis=0)
-                ax.plot(wl, mean, label=grp, color=color, lw=1.5)
-                ax.fill_between(wl, mean - std, mean + std,
-                                alpha=0.2, color=color)
+            # ---------------------------------------------------------
+            # Each plant (level2) is a *single* row → plot its spectrum
+            # ---------------------------------------------------------
+            plants = sub[l2_col].unique()
+            treatments = sub[l3_col].unique()
+            colors = _palette(palette, len(treatments))
+
+            # Build a colour map: treatment → colour
+            colour_map = dict(zip(treatments, colors))
+
+            for plant in plants:
+                plant_row = sub[sub[l2_col] == plant]
+                if plant_row.empty:
+                    continue
+                trt = plant_row[l3_col].iloc[0]          # treatment of this plant
+                spec = plant_row[spec_cols].values.astype(float).ravel()
+                ax.plot(wavelengths, spec,
+                        color=colour_map[trt],
+                        lw=1.5,
+                        label=str(trt) if plant == plants[0] else None)  # label once per treatment
+                # Optional: add a tiny marker at the start of the line for visibility
+                ax.scatter(wavelengths[0], spec[0], color=colour_map[trt],
+                           s=15, edgecolors='k', zorder=5)
 
             ax.set_title(str(l1), fontsize=11)
             ax.set_xlabel('Wavelength (nm)')
             ax.set_ylabel('Reflectance')
-            ax.legend(title=l3_col, fontsize=8)
+            # Only add the legend if there is at least one treatment label
+            handles, labels = ax.get_legend_handles_labels()
+            if labels:
+                ax.legend(title=l3_col, fontsize=8)
             ax.grid(True, alpha=0.3)
 
-        safe_date = str(date).replace('-', '')
-        _save(fig, output_dir / f'{title}_{safe_date}_mean_spectra.png', dpi=dpi)
-
+        # -------------------------------------------------------------
+        # Save – use the safe stem helper (no illegal characters)
+        # -------------------------------------------------------------
+        stem = _safe_stem(title, date)
+        _save(fig, output_dir / f'{stem}_mean_spectra.png', dpi=dpi)
 
 # ── 2. Confusion matrices ──────────────────────────────────────────────────────
 
@@ -341,58 +431,182 @@ def plot_pca_scores(
     cols:       dict,
     title:      str = 'analysis',
     dpi:        int = 150,
-    figsize:    tuple = (5, 4),
+    figsize:    tuple = (10, 5),
     palette:    str = 'tab10',
 ) -> None:
     """
-    Scatter plot of the first two PCA score vectors (PC1 vs PC2),
-    coloured by level3 class, for each level1 / date combination.
-    Consumes pre-computed 'scores_df' stored by classifier.py.
+    Scatter plot of PC1 vs PC2 and PC1 vs PC3 for each level1 / date,
+    with 95 % confidence ellipses.
     """
     output_dir = Path(output_dir)
-    l3_col     = cols['level3']
+    l3_col = cols['level3']
+    palette_name = palette
 
     for l1_val, dates in results.items():
         for date_val, res in dates.items():
             scores_df = res.get('scores_df')
-
             if scores_df is None or scores_df.empty:
-                log.warning('No scores_df for %s / %s — skipping.',
-                            l1_val, date_val)
+                log.warning('No scores_df for %s / %s — skipping.', l1_val, date_val)
                 continue
 
-            if 'PC1' not in scores_df.columns or 'PC2' not in scores_df.columns:
-                log.warning('scores_df missing PC1/PC2 for %s / %s — skipping.',
-                            l1_val, date_val)
+            # Ensure the required PCs exist
+            required = {'PC1', 'PC2', 'PC3'}
+            missing = required - set(scores_df.columns)
+            if missing:
+                log.warning('Missing PCs %s for %s / %s — skipping.', missing, l1_val, date_val)
                 continue
+
+            # Setup figure with two side‑by‑side subplots
+            fig, (ax12, ax13) = plt.subplots(1, 2, figsize=figsize)
+            pair_info = [
+                ('PC1', 'PC2', ax12, 'PC1 vs PC2'),
+                ('PC1', 'PC3', ax13, 'PC1 vs PC3')
+            ]
 
             classes = sorted(scores_df[l3_col].unique())
-            colors  = _palette(palette, len(classes))
+            colors = _palette(palette_name, len(classes))
 
-            fig, ax = plt.subplots(figsize=figsize)
+            for x_col, y_col, ax, subtitle in pair_info:
+                for col, cls in zip(colors, classes):
+                    mask = scores_df[l3_col] == cls
+                    x = scores_df.loc[mask, x_col].values
+                    y = scores_df.loc[mask, y_col].values
 
-            for color, cls in zip(colors, classes):
-                mask = scores_df[l3_col] == cls
-                ax.scatter(
-                    scores_df.loc[mask, 'PC1'],
-                    scores_df.loc[mask, 'PC2'],
-                    label      = str(cls),
-                    color      = color,
-                    alpha      = 0.75,
-                    edgecolors = 'k',
-                    linewidths = 0.4,
-                    s          = 50,
-                )
+                    if len(x) == 0:
+                        continue
 
-            ax.set_xlabel('PC1')
-            ax.set_ylabel('PC2')
-            ax.set_title(f'PCA Scores  |  {l1_val}  |  {date_val}', fontsize=11)
-            ax.legend(title=l3_col, fontsize=8)
-            ax.grid(True, alpha=0.3)
+                    ax.scatter(
+                        x, y,
+                        label=str(cls),
+                        color=col,
+                        edgecolors='k',
+                        alpha=0.75,
+                        s=45,
+                        linewidths=0.5,
+                    )
+                    # ---- draw the 95 % ellipse for this class ----
+                    draw_ellipse(ax, x, y, confidence=0.95)
+
+                ax.set_xlabel(x_col)
+                ax.set_ylabel(y_col)
+                ax.set_title(subtitle, fontsize=10)
+                ax.grid(True, alpha=0.3)
+
+                # Legend – only once per axis
+                handles, labels = ax.get_legend_handles_labels()
+                if labels:
+                    ax.legend(handles, labels, title=l3_col, fontsize=8)
+
+            fig.suptitle(f'{title} | {l1_val} | {date_val}', fontsize=12)
 
             stem = _safe_stem(l1_val, date_val)
             _save(fig, output_dir / f'{stem}_pca_scores.png', dpi=dpi)
 
+
+# --------------------------------------------------------------
+# DAILY PCA – PC1 vs PC2  &  PC1 vs PC3 (plant‑averaged spectra)
+# --------------------------------------------------------------
+def plot_daily_pca(
+    results:    dict,
+    output_dir: str | Path,
+    cols:       dict,
+    title:      str = 'analysis',
+    dpi:        int = 150,
+    figsize:    tuple = (12, 5),
+    palette:    str = 'tab10',
+) -> None:
+    """
+    For every species (level1) and every collection day:
+        * left panel  – PC1 vs PC2
+        * right panel – PC1 vs PC3 (if PC3 exists)
+    Points are the **average spectrum of each plant_id** for that day,
+    coloured by treatment (level3).  The axis titles contain the %‑explained
+    variance of the displayed components.
+    """
+    output_dir = Path(output_dir)
+    l3_col = cols['level3']
+
+    for l1_val, dates in results.items():
+        for date_val, res in dates.items():
+            scores_df = res.get('scores_df')
+            if scores_df is None or scores_df.empty:
+                continue
+
+            # -----------------------------------------------------------------
+            # Verify we have PC1/PC2 (always) and PC3 (optional)
+            # -----------------------------------------------------------------
+            have_pc2 = {'PC1', 'PC2'} <= set(scores_df.columns)
+            have_pc3 = {'PC1', 'PC3'} <= set(scores_df.columns)
+
+            if not have_pc2:
+                log.warning('Daily PCA: missing PC1/PC2 for %s / %s – skipping.',
+                            l1_val, date_val)
+                continue
+
+            # -----------------------------------------------------------------
+            # Colour map for treatments
+            # -----------------------------------------------------------------
+            treatments = sorted(scores_df[l3_col].unique())
+            colors = _palette(palette, len(treatments))
+            colour_map = dict(zip(treatments, colors))
+
+            # -----------------------------------------------------------------
+            # Figure – two side‑by‑side sub‑plots
+            # -----------------------------------------------------------------
+            fig, (ax12, ax13) = plt.subplots(1, 2, figsize=figsize)
+
+            # -------------------- PC1 vs PC2 --------------------
+            for trt in treatments:
+                mask = scores_df[l3_col] == trt
+                ax12.scatter(
+                    scores_df.loc[mask, 'PC1'],
+                    scores_df.loc[mask, 'PC2'],
+                    label=str(trt),
+                    color=colour_map[trt],
+                    edgecolors='k',
+                    s=55,
+                    alpha=0.8,
+                )
+            var1 = res['explained_variance'][0] * 100
+            var2 = res['explained_variance'][1] * 100 if len(res['explained_variance']) > 1 else 0
+            ax12.set_xlabel(f'PC1 ({var1:.1f} %)')
+            ax12.set_ylabel(f'PC2 ({var2:.1f} %)')
+            ax12.set_title('PC1 vs PC2')
+            ax12.grid(True, alpha=0.3)
+
+            # -------------------- PC1 vs PC3 (optional) --------------------
+            if have_pc3:
+                for trt in treatments:
+                    mask = scores_df[l3_col] == trt
+                    ax13.scatter(
+                        scores_df.loc[mask, 'PC1'],
+                        scores_df.loc[mask, 'PC3'],
+                        label=str(trt),
+                        color=colour_map[trt],
+                        edgecolors='k',
+                        s=55,
+                        alpha=0.8,
+                    )
+                var3 = res['explained_variance'][2] * 100 if len(res['explained_variance']) > 2 else 0
+                ax13.set_xlabel(f'PC1 ({var1:.1f} %)')
+                ax13.set_ylabel(f'PC3 ({var3:.1f} %)')
+                ax13.set_title('PC1 vs PC3')
+                ax13.grid(True, alpha=0.3)
+            else:
+                # hide the empty panel to keep the layout clean
+                ax13.set_visible(False)
+
+            # -----------------------------------------------------------------
+            # Shared legend (only once)
+            # -----------------------------------------------------------------
+            handles, labels = ax12.get_legend_handles_labels()
+            if labels:
+                ax12.legend(handles, labels, title=l3_col, fontsize=8)
+
+            fig.suptitle(f'{title} | {l1_val} | {date_val}', fontsize=12)
+
+            stem = _safe_stem(l1_val, date_val)
+            _save(fig, output_dir / f'{stem}_daily_pca.png', dpi=dpi)
 
 # ── 7. Metrics heatmap ─────────────────────────────────────────────────────────
 
@@ -406,83 +620,105 @@ def plot_metrics_heatmap(
     metrics:    list[str] | None = None,
 ) -> None:
     """
-    Heatmap of per-class metrics (precision, recall, f1) across dates,
-    one figure per level1.
-    Rows = class labels, Columns = dates, faceted by metric.
+    Heatmap of macro‑averaged metrics (precision, recall, F1) across dates,
+    one figure per level1 (species).
+
+    The original implementation expected a column named ``class`` in the
+    concatenated metrics DataFrames, which does not exist in the current
+    ``run_plsda`` output (the DataFrames contain only macro scores).  This
+    rewritten version works with the existing structure and will also
+    gracefully handle a future ``class`` column if it appears.
+
+    Parameters
+    ----------
+    results, output_dir, title, dpi, figsize, cmap : same as before
+    metrics : list of metric column names to plot.
+              If ``None`` the default list ``['precision','recall','f1']`` is used.
     """
     output_dir = Path(output_dir)
-    metrics    = metrics or ['precision', 'recall', 'f1']
+    metrics = metrics or ['precision', 'recall', 'f1']
 
     for l1_val, dates in results.items():
-        # Collect all metrics_df rows
-        records = []
+        # -----------------------------------------------------------------
+        # 1️⃣ Gather per‑date metrics DataFrames
+        # -----------------------------------------------------------------
+        records = []                 # one row per fold
         for date_val, res in dates.items():
             mdf = res.get('metrics_df')
             if mdf is None or mdf.empty:
                 continue
-            mdf = mdf.copy()
-            mdf['date'] = date_val
-            records.append(mdf)
+
+            # Keep only macro columns we care about
+            sub = mdf[['precision', 'recall', 'f1']].copy()
+            sub['date'] = date_val
+            records.append(sub)
 
         if not records:
-            log.warning('No metrics data for %s — skipping heatmap.', l1_val)
+            log.warning('No metric data for %s — skipping heatmap.', l1_val)
             continue
 
-        combined  = pd.concat(records, ignore_index=True)
-        all_dates = sorted(combined['date'].unique())
-        classes   = sorted(combined['class'].unique())
+        # -----------------------------------------------------------------
+        # 2️⃣ Concatenate and compute the *mean* metric per date
+        # -----------------------------------------------------------------
+        all_metrics = pd.concat(records, ignore_index=True)
 
-        n_metrics = len(metrics)
-        fig, axes = plt.subplots(
-            1, n_metrics,
-            figsize=(figsize[0], figsize[1]),
-            sharey=True,
+        # Pivot so rows = metric, columns = date
+        heatmap_df = (
+            all_metrics
+            .groupby('date')[metrics]
+            .mean()                     # macro average across folds
+            .T                         # transpose → rows are metrics
         )
-        if n_metrics == 1:
-            axes = [axes]
+        # Ensure the dates appear in chronological order
+        heatmap_df = heatmap_df[sorted(heatmap_df.columns)]
 
-        fig.suptitle(f'{title}  |  {l1_val}  |  Metrics Heatmap', fontsize=12)
-
+        # -----------------------------------------------------------------
+        # 3️⃣ Plot the heat‑map
+        # -----------------------------------------------------------------
+        fig, ax = plt.subplots(figsize=figsize)
         cmap_obj = plt.get_cmap(cmap)
 
-        for ax, metric in zip(axes, metrics):
-            # Build matrix: rows=classes, cols=dates
-            matrix = np.full((len(classes), len(all_dates)), np.nan)
-            for ci, cls in enumerate(classes):
-                for di, date_val in enumerate(all_dates):
-                    row = combined[
-                        (combined['class'] == cls) &
-                        (combined['date']  == date_val)
-                    ]
-                    if not row.empty and metric in row.columns:
-                        matrix[ci, di] = row[metric].iloc[0]
+        im = ax.imshow(
+            heatmap_df.values,
+            aspect='auto',
+            cmap=cmap_obj,
+            vmin=0,
+            vmax=1,
+            interpolation='nearest',
+        )
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-            im = ax.imshow(matrix, aspect='auto', cmap=cmap_obj,
-                           vmin=0, vmax=1, interpolation='nearest')
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        # Tick labels
+        ax.set_xticks(np.arange(len(heatmap_df.columns)))
+        ax.set_xticklabels(
+            [str(d) for d in heatmap_df.columns],
+            rotation=45,
+            ha='right',
+            fontsize=9,
+        )
+        ax.set_yticks(np.arange(len(heatmap_df.index)))
+        ax.set_yticklabels(heatmap_df.index, fontsize=9)
 
-            ax.set_xticks(range(len(all_dates)))
-            ax.set_xticklabels(all_dates, rotation=45, ha='right', fontsize=8)
-            ax.set_yticks(range(len(classes)))
-            ax.set_yticklabels(classes, fontsize=8)
-            ax.set_title(metric.capitalize(), fontsize=10)
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Metric')
+        ax.set_title(f'{title} | {l1_val} | Macro‑Metric Heatmap', fontsize=12)
 
-            # Annotate cells
-            for ci in range(len(classes)):
-                for di in range(len(all_dates)):
-                    val = matrix[ci, di]
-                    if np.isnan(val):
-                        ax.text(di, ci, 'N/A', ha='center', va='center',
-                                fontsize=7, color='grey')
-                    else:
-                        brightness = val  # 0–1 range
-                        txt_color  = 'white' if brightness < 0.5 else 'black'
-                        ax.text(di, ci, f'{val:.2f}', ha='center', va='center',
-                                fontsize=7, color=txt_color)
+        # Annotate each cell with the numeric value
+        for i in range(len(heatmap_df.index)):
+            for j in range(len(heatmap_df.columns)):
+                val = heatmap_df.iloc[i, j]
+                txt_color = 'white' if val > 0.6 else 'black'
+                ax.text(
+                    j, i, f'{val:.2f}',
+                    ha='center', va='center',
+                    color=txt_color,
+                    fontsize=8,
+                )
 
-        fig.tight_layout()
-        _save(fig, output_dir / f'{str(l1_val).replace(" ", "_")}_metrics_heatmap.png', dpi=dpi)
+        stem = _safe_stem(l1_val, '')
+        _save(fig, output_dir / f'{stem}_metrics_heatmap.png', dpi=dpi)
 
+        log.info('Saved metrics heatmap for %s → %s', l1_val, output_dir)
 
 # ── 8. Trajectory (centroid path over time) ────────────────────────────────────
 
@@ -498,82 +734,98 @@ def plot_trajectory_centroids(
     score_y:    str = 'PC2',
 ) -> None:
     """
-    Plot centroid trajectories through score space over time,
-    one line per treatment (level3), one figure per level1.
-    Day-1 centroid is marked with a star; all days are annotated.
+    Plot treatment‑level centroids in PC space over time.
+    Works with both the *old* per‑date dict format and the *new* single‑dict
+    format returned by ``compute_trajectories``.
     """
     output_dir = Path(output_dir)
-    l3_col     = cols['level3']
+    l3_col = cols['level3']
 
-    for l1_val, dates in results.items():
-        # Gather centroids
-        records = []
-        for date_val, res in dates.items():
-            scores_df = res.get('scores_df')
-            if scores_df is None or scores_df.empty:
+    # -----------------------------------------------------------------
+    # Detect which structure we received
+    # -----------------------------------------------------------------
+    # *Old* format: results[l1][date] → dict with key 'scores_df'
+    # *New* format: results[l1] → dict containing the key 'scores' (DataFrame)
+    # -----------------------------------------------------------------
+    for l1_val, content in results.items():
+        # -----------------------------------------------------------------
+        # 1️⃣ If `content` looks like a dict of dates (contains a dict)
+        # -----------------------------------------------------------------
+        if isinstance(content, dict) and any(isinstance(v, dict) for v in content.values()):
+            # legacy path – iterate over dates
+            records = []
+            for date_val, res in content.items():
+                df = res.get('scores_df')
+                if df is None or df.empty:
+                    continue
+                if score_x not in df.columns or score_y not in df.columns:
+                    continue
+                for cls in df[l3_col].unique():
+                    mask = df[l3_col] == cls
+                    cx = df.loc[mask, score_x].mean()
+                    cy = df.loc[mask, score_y].mean()
+                    records.append(
+                        {'date': date_val, 'class': cls, 'cx': cx, 'cy': cy}
+                    )
+        # -----------------------------------------------------------------
+        # 2️⃣ New format – the DataFrame is directly under the key 'scores'
+        # -----------------------------------------------------------------
+        elif isinstance(content, dict) and 'scores' in content:
+            df = content['scores']
+            if df.empty or score_x not in df.columns or score_y not in df.columns:
                 continue
-            if score_x not in scores_df.columns or score_y not in scores_df.columns:
-                continue
-            for cls in scores_df[l3_col].unique():
-                mask = scores_df[l3_col] == cls
-                cx   = scores_df.loc[mask, score_x].mean()
-                cy   = scores_df.loc[mask, score_y].mean()
-                records.append({'date': date_val, 'class': cls, 'cx': cx, 'cy': cy})
-
-        if not records:
-            log.warning('No score data for trajectory plot: %s — skipping.', l1_val)
+            records = []
+            for cls in df[l3_col].unique():
+                mask = df[l3_col] == cls
+                cx = df.loc[mask, score_x].mean()
+                cy = df.loc[mask, score_y].mean()
+                # Use the date column that already exists in the scores DF
+                dates = df.loc[mask, cols['date']].unique()
+                for d in dates:
+                    records.append({'date': d, 'class': cls, 'cx': cx, 'cy': cy})
+        else:
+            # Unexpected format – skip this level
+            log.warning('Trajectory centroids: unrecognised structure for %s — skipping.', l1_val)
             continue
 
-        traj      = pd.DataFrame(records).sort_values('date')
-        classes   = sorted(traj['class'].unique())
-        all_dates = sorted(traj['date'].unique())
-        colors    = _palette(palette, len(classes))
+        # -------------------------------------------------------------
+        # Build the tidy DataFrame for plotting
+        # -------------------------------------------------------------
+        traj_df = pd.DataFrame(records)
+        if traj_df.empty:
+            continue
+        traj_df = traj_df.sort_values('date')
+        classes = sorted(traj_df['class'].unique())
+        colors = _palette(palette, len(classes))
 
+        # -------------------------------------------------------------
+        # Plot
+        # -------------------------------------------------------------
         fig, ax = plt.subplots(figsize=figsize)
 
         for color, cls in zip(colors, classes):
-            sub = traj[traj['class'] == cls].sort_values('date')
-            xs  = sub['cx'].values
-            ys  = sub['cy'].values
-            ds  = sub['date'].values
+            sub = traj_df[traj_df['class'] == cls]
+            ax.plot(sub['cx'].values, sub['cy'].values, color=color,
+                    lw=1.5, alpha=0.8, label=str(cls))
 
-            ax.plot(xs, ys, color=color, lw=1.5, alpha=0.8)
+            # annotate each point
+            for x, y, d in zip(sub['cx'], sub['cy'], sub['date']):
+                ax.scatter(x, y, color=color, edgecolors='k', s=55, zorder=5)
+                ax.annotate(str(d), xy=(x, y), xytext=(5, 5),
+                            textcoords='offset points', fontsize=7, color=color)
 
-            for i, (x, y, d) in enumerate(zip(xs, ys, ds)):
-                if i == 0:
-                    # Day-1: star marker + annotation
-                    ax.scatter(x, y, marker='*', s=220, color=color,
-                               edgecolors='k', linewidths=0.5, zorder=5)
-                else:
-                    ax.scatter(x, y, marker='o', s=55, color=color,
-                               edgecolors='k', linewidths=0.4, zorder=5)
-
-                ax.annotate(
-                    str(d),
-                    xy       = (x, y),
-                    xytext   = (5, 5),
-                    textcoords = 'offset points',
-                    fontsize = 7,
-                    color    = color,
-                )
-
-        # Legend proxies
-        import matplotlib.lines as mlines
-        handles = [
-            mlines.Line2D([], [], color=c, marker='o', markersize=6,
-                          label=str(cls), linewidth=1.5)
-            for c, cls in zip(colors, classes)
-        ]
-        ax.legend(handles=handles, title=l3_col, fontsize=8)
+        # Legend (only if we have labels)
+        handles, labels = ax.get_legend_handles_labels()
+        if labels:
+            ax.legend(handles, labels, title=l3_col, fontsize=8)
 
         ax.set_xlabel(score_x)
         ax.set_ylabel(score_y)
-        ax.set_title(f'Centroid Trajectories  |  {l1_val}', fontsize=11)
+        ax.set_title(f'Centroid Trajectories | {l1_val}', fontsize=11)
         ax.grid(True, alpha=0.3)
 
-        stem = str(l1_val).replace(' ', '_')
+        stem = _safe_stem(l1_val, '')
         _save(fig, output_dir / f'{stem}_trajectory_centroids.png', dpi=dpi)
-
 
 # ── 9. Full scatter trajectory (all points, faded by time) ────────────────────
 
@@ -589,63 +841,101 @@ def plot_trajectory(
     score_y:    str = 'PC2',
 ) -> None:
     """
-    Scatter all individual observations through score space,
-    alpha-faded by time index (earlier = more transparent),
-    coloured by treatment (level3), one figure per level1.
+    Scatter all individual observations in PC space, coloured by treatment,
+    with a time‑fade effect. Works with both the legacy per‑date dict format
+    and the new single‑dict format returned by ``compute_trajectories``.
     """
     output_dir = Path(output_dir)
-    l3_col     = cols['level3']
+    l3_col = cols['level3']
 
-    for l1_val, dates in results.items():
-        frames = []
-        for date_val, res in dates.items():
-            scores_df = res.get('scores_df')
-            if scores_df is None or scores_df.empty:
-                continue
-            if score_x not in scores_df.columns or score_y not in scores_df.columns:
-                continue
-            df = scores_df[[score_x, score_y, l3_col]].copy()
-            df['date'] = date_val
-            frames.append(df)
+    for l1_val, content in results.items():
+        # -----------------------------------------------------------------
+        # Detect which result structure we have (legacy vs new)
+        # -----------------------------------------------------------------
+        if isinstance(content, dict) and any(isinstance(v, dict) for v in content.values()):
+            # ----- LEGACY FORMAT: dict of dates each holding a 'scores_df' -----
+            frames = []
+            for date_val, res in content.items():
+                df = res.get('scores_df')
+                if df is None or df.empty:
+                    continue
+                if score_x not in df.columns or score_y not in df.columns:
+                    continue
+                tmp = df[[score_x, score_y, l3_col]].copy()
+                tmp['date'] = date_val
+                frames.append(tmp)
 
-        if not frames:
-            log.warning('No score data for trajectory plot: %s — skipping.', l1_val)
+        elif isinstance(content, dict) and 'scores' in content:
+            # ----- NEW FORMAT: single DataFrame already contains the date column -----
+            df = content['scores']
+            if df.empty or score_x not in df.columns or score_y not in df.columns:
+                continue
+
+            # Rename the original date column to a uniform name 'date'
+            date_original = cols['date']
+            tmp = df[[score_x, score_y, l3_col, date_original]].rename(
+                columns={date_original: 'date'}
+            )
+            frames = [tmp]   # a single‑element list – same interface as the legacy case
+
+        else:
+            log.warning(
+                'Trajectory plot: unrecognised structure for %s — skipping.',
+                l1_val,
+            )
             continue
 
-        combined  = pd.concat(frames, ignore_index=True)
+        if not frames:
+            continue
+
+        # -------------------------------------------------------------
+        # Combine all frames (whether from many dates or a single DF)
+        # -------------------------------------------------------------
+        combined = pd.concat(frames, ignore_index=True)
+
+        # -------------------------------------------------------------
+        # Build a colour map for the treatments (level3)
+        # -------------------------------------------------------------
+        classes = sorted(combined[l3_col].unique())
+        colors = _palette(palette, len(classes))
+        color_map = dict(zip(classes, colors))
+
+        # -------------------------------------------------------------
+        # Compute fade factor (earlier dates = more transparent)
+        # -------------------------------------------------------------
         all_dates = sorted(combined['date'].unique())
         n_dates   = len(all_dates)
         date_rank = {d: i for i, d in enumerate(all_dates)}
-
-        classes = sorted(combined[l3_col].unique())
-        colors  = _palette(palette, len(classes))
-        color_map = dict(zip(classes, colors))
 
         fig, ax = plt.subplots(figsize=figsize)
 
         for _, row in combined.iterrows():
             alpha = 0.15 + 0.75 * (date_rank[row['date']] / max(n_dates - 1, 1))
             ax.scatter(
-                row[score_x], row[score_y],
-                color      = color_map[row[l3_col]],
-                alpha      = alpha,
+                row[score_x],
+                row[score_y],
+                color   = color_map[row[l3_col]],
+                alpha   = alpha,
                 edgecolors = 'none',
-                s          = 20,
+                s       = 20,
             )
 
-        # Legend proxies
+        # -------------------------------------------------------------
+        # Legend (only if we actually have classes)
+        # -------------------------------------------------------------
         import matplotlib.lines as mlines
         handles = [
-            mlines.Line2D([], [], color=c, marker='o', markersize=6,
-                          linestyle='None', label=str(cls))
+            mlines.Line2D([], [], color=c, marker='o', linestyle='None',
+                         markersize=6, label=str(cls))
             for cls, c in color_map.items()
         ]
-        ax.legend(handles=handles, title=l3_col, fontsize=8)
+        if handles:
+            ax.legend(handles=handles, title=l3_col, fontsize=8)
 
         ax.set_xlabel(score_x)
         ax.set_ylabel(score_y)
-        ax.set_title(f'Score Trajectory  |  {l1_val}  |  (fade = time)', fontsize=11)
+        ax.set_title(f'Score Trajectory | {l1_val} (fade = time)', fontsize=11)
         ax.grid(True, alpha=0.3)
 
-        stem = str(l1_val).replace(' ', '_')
+        stem = _safe_stem(l1_val, '')
         _save(fig, output_dir / f'{stem}_trajectory.png', dpi=dpi)

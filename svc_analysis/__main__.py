@@ -29,7 +29,8 @@ from .plots import (
     plot_metrics_heatmap,
     plot_pca_scores,
     plot_trajectory_centroids,
-    plot_trajectory,
+    plot_trajectory, 
+    plot_daily_pca,
 )
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -73,95 +74,239 @@ def _get_cols(cfg: dict) -> dict:
         'date':     cfg['scan']['date_col'],
     }
 
-# ── Pipeline ───────────────────────────────────────────────────────────────────
-
+# svc_analysis/__main__.py
+# --------------------------------------------------------------
+#  run_pipeline – the heart of the whole analysis
+# --------------------------------------------------------------
 def run_pipeline(cfg: dict) -> None:
+    """
+    Execute the full pipeline with plant‑level daily aggregation.
+    All downstream analyses (PCA, PLS‑DA, trajectories, diff‑spectra,
+    VIP, etc.) are performed on the **average spectrum of each plant
+    per day**, guaranteeing a consistent data foundation.
+    """
+    # -----------------------------------------------------------------
+    # 0️⃣ Prepare output folder, title and column‑mapping
+    # -----------------------------------------------------------------
     output_dir = Path(cfg['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     title = cfg.get('title', 'analysis')
-    cols  = _get_cols(cfg)
+    cols  = _get_cols(cfg)                     # level1, level2, level3, scan_id, date
     plot_cfg = cfg.get('plots', {})
 
-    # 1. Load Data
-    log.info('Loading spectra and metadata...')
-    spectra_df = pd.read_csv(cfg['spectra_path'])
-    metadata_df = pd.read_csv(cfg['metadata_path'])
+    # -----------------------------------------------------------------
+    # 1️⃣ Load raw CSVs (unchanged)
+    # -----------------------------------------------------------------
+    log.info('Loading raw spectra and metadata...')
+    spectra_raw  = pd.read_csv(cfg['spectra_path'])
+    metadata_raw = pd.read_csv(cfg['metadata_path'])
 
-    # 2. PCA Analysis (Per-day & Global)
-    log.info('Running PCA analysis...')
+    # -----------------------------------------------------------------
+    # 2️⃣ Aggregate → ONE averaged spectrum per plant per calendar day
+    # -----------------------------------------------------------------
+    log.info('Aggregating scans: 1 average spectrum per plant per day …')
+    from .pca import aggregate_plant_day   # helper added in pca.py
+    aggregated = aggregate_plant_day(spectra_raw, metadata_raw, cols)
+
+    # -----------------------------------------------------------------
+    # 3️⃣ Split the aggregated DataFrame back into the two objects the
+    #    analysis functions expect (spectra + metadata)
+    # -----------------------------------------------------------------
+    spec_cols = [c for c in aggregated.columns if c.startswith('w_')]
+    agg_spectra   = aggregated[[cols['scan_id']] + spec_cols]
+
+    agg_metadata = aggregated[[cols['scan_id'],
+                              cols['level1'],
+                              cols['level2'],
+                              cols['level3'],
+                              cols['date']]]
+
+    log.info('Aggregation complete → %d plant‑day rows', len(agg_spectra))
+
+    # -----------------------------------------------------------------
+    # 4️⃣ Run **all** analyses on the *aggregated* data
+    # -----------------------------------------------------------------
+    log.info('Running PCA analysis on aggregated plant spectra …')
     pca_results = run_pca(
-        spectra_df = spectra_df,
-        metadata_df = metadata_df,
-        cols = cols,
-        output_dir = output_dir,
+        spectra_df   = agg_spectra,
+        metadata_df  = agg_metadata,
+        cols         = cols,
+        output_dir   = output_dir,
         n_components = cfg.get('trajectory', {}).get('n_components', 10)
     )
 
-    # 3. PLS-DA Classification
-    log.info('Running PLS-DA classification...')
+    log.info('Running PLS‑DA classification on aggregated data …')
     pls_cfg = cfg.get('plsda', {})
     pls_results = run_plsda(
-        spectra_df = spectra_df,
-        metadata_df = metadata_df,
-        cols = cols,
-        output_dir = output_dir,
-        cv = pls_cfg.get('cv', 'stratified'),
-        n_folds = pls_cfg.get('n_folds', 5),
+        spectra_df   = agg_spectra,
+        metadata_df  = agg_metadata,
+        cols         = cols,
+        output_dir   = output_dir,
+        cv           = pls_cfg.get('cv', 'stratified'),
+        n_folds      = pls_cfg.get('n_folds', 5),
         n_iter_search = pls_cfg.get('n_iter_search', 20),
-        random_state = pls_cfg.get('random_state', 42),
+        random_state = pls_cfg.get('random_state', 42)
     )
 
-    # 4. Trajectory Calculation
-    log.info('Computing trajectories...')
+    log.info('Computing trajectories …')
     traj_results = compute_trajectories(
-        spectra_df = spectra_df,
-        metadata_df = metadata_df,
-        cols = cols,
-        output_dir = output_dir,
+        spectra_df   = agg_spectra,
+        metadata_df  = agg_metadata,
+        cols         = cols,
+        output_dir   = output_dir,
         n_components = cfg.get('trajectory', {}).get('n_components', 10)
     )
 
-    # 5. Difference Spectra
-    log.info('Computing difference spectra...')
+    log.info('Computing difference spectra …')
     compute_diff_spectra(
-        spectra_df = spectra_df,
-        metadata_df = metadata_df,
-        cols = cols,
-        output_dir = output_dir
+        spectra_df   = agg_spectra,
+        metadata_df  = agg_metadata,
+        cols         = cols,
+        output_dir   = output_dir
     )
 
-    # 6. Plotting
-    log.info('Generating final figures...')
-    
-    # General spectra
-    plot_mean_spectra(spectra_df, metadata_df, cols, output_dir, title=title, **plot_cfg)
+    # -----------------------------------------------------------------
+    # 5️⃣ Plotting – only pass arguments that each routine accepts
+    # -----------------------------------------------------------------
+    log.info('Generating final figures…')
 
-    # PCA-based plots
-    plot_pca_scores(pca_results, output_dir, cols, title=title, **plot_cfg)
+    # -----------------------------------------------------------------
+    # Re‑use the same three argument bundles throughout the block
+    # -----------------------------------------------------------------
+    common_args = {
+        'dpi'      : plot_cfg.get('dpi', 150),
+        'figsize'  : plot_cfg.get('figsize', (10, 4)),
+    }
 
-    # PLS-DA based plots
-    plot_confusion_matrices(pls_results, output_dir, title=title, **plot_cfg)
-    plot_vip_scores(pls_results, output_dir, title=title, **plot_cfg)
-    plot_f1_over_dates(pls_results, output_dir, title=title, **plot_cfg)
-    plot_metrics_heatmap(pls_results, output_dir, title=title, **plot_cfg)
+    palette_args = {
+        'palette'  : plot_cfg.get('palette', 'tab10')
+    }
 
-    # Trajectory based plots
-    # NOTE: These expect the consolidated results from trajectory.py
-    plot_trajectory_centroids(traj_results, output_dir, cols, title=title, **plot_cfg)
-    plot_trajectory(traj_results, output_dir, cols, title=title, **plot_cfg)
+    cmap_args = {
+        'cmap'     : plot_cfg.get('cmap', 'Blues'),
+        'dpi'      : plot_cfg.get('dpi', 150),
+        'figsize' : plot_cfg.get('figsize', (10, 4)),
+    }
 
-    # 7. Final Metrics Summary
+    # -------------------------------------------------------------
+    # 5.1 Mean spectra (raw data – shows variability)
+    # -------------------------------------------------------------
+    plot_mean_spectra(
+        spectra_df   = agg_spectra,
+        metadata_df = agg_metadata,
+        cols         = cols,
+        output_dir   = output_dir,
+        title        = title,
+        **common_args,
+        **palette_args,
+    )
+
+    # -------------------------------------------------------------
+    # 5.2 DAILY PCA (plant‑averaged spectra) – two panels per day
+    # -------------------------------------------------------------
+    plot_daily_pca(
+        results    = pca_results,       # contains per‑day scores
+        output_dir = output_dir,
+        cols       = cols,
+        title      = title,
+        **common_args,
+        **palette_args,
+    )
+
+    # -------------------------------------------------------------
+    # 5.3 Global PCA (all days together) – optional overview
+    # -------------------------------------------------------------
+    plot_pca_scores(
+        results    = pca_results,
+        output_dir = output_dir,
+        cols       = cols,
+        title      = title,
+        **common_args,
+        **palette_args,
+    )
+
+    # -------------------------------------------------------------
+    # 5.4 Confusion matrices (PLS‑DA)
+    # -------------------------------------------------------------
+    plot_confusion_matrices(
+        results    = pls_results,
+        output_dir = output_dir,
+        title      = title,
+        **cmap_args,
+    )
+
+    # -------------------------------------------------------------
+    # 5.5 Metrics heatmap (macro metrics)
+    # -------------------------------------------------------------
+    plot_metrics_heatmap(
+        results    = pls_results,
+        output_dir = output_dir,
+        title      = title,
+        **cmap_args,
+    )
+
+    # -------------------------------------------------------------
+    # 5.6 VIP scores (PLS‑DA) – no palette argument
+    # -------------------------------------------------------------
+    plot_vip_scores(
+        results    = pls_results,
+        output_dir = output_dir,
+        title      = title,
+        **common_args,          # palette deliberately omitted
+    )
+
+    # -------------------------------------------------------------
+    # 5.7 F1‑over‑dates (PLS‑DA)
+    # -------------------------------------------------------------
+    plot_f1_over_dates(
+        results    = pls_results,
+        output_dir = output_dir,
+        title      = title,
+        **common_args,
+        **palette_args,
+    )
+
+    # -------------------------------------------------------------
+    # 5.8 Trajectory plots (centroids + full trajectories)
+    # -------------------------------------------------------------
+    plot_trajectory_centroids(
+        results    = traj_results,
+        output_dir = output_dir,
+        cols       = cols,
+        title      = title,
+        **common_args,
+        **palette_args,
+    )
+
+    plot_trajectory(
+        results    = traj_results,
+        output_dir = output_dir,
+        cols       = cols,
+        title      = title,
+        **common_args,
+        **palette_args,
+    )
+
+    # -----------------------------------------------------------------
+    # 6️⃣ Final combined metrics CSV + console summary
+    # -----------------------------------------------------------------
     all_metrics = []
-    for l1, dates in pls_results.items():
+    for level1, dates in pls_results.items():
         for date, res in dates.items():
             all_metrics.append(res['metrics_df'])
 
     if all_metrics:
         combined = pd.concat(all_metrics, ignore_index=True)
         combined.to_csv(output_dir / f'{title}_all_metrics.csv', index=False)
-        summary = combined.groupby(['level1', 'date'])[['f1', 'precision', 'recall']].agg(['mean', 'std']).round(3)
-        print('\n── PLS-DA Summary ──────────────────────────────────────────────────')
+
+        summary = (
+            combined
+            .groupby(['level1', 'date'])[['f1', 'precision', 'recall']]
+            .agg(['mean', 'std'])
+            .round(3)
+        )
+        print('\n── PLS‑DA Summary (Aggregated Plants) ───────────────────────────────')
         print(summary.to_string())
         print()
 

@@ -11,12 +11,18 @@
 
 hierarchy:
   level1:   species       # coarsest grouping (parent)
-  level2:   plant_id         # individual/replicate
-  level3:   treatment     # finest grouping (most granular)
+  level2:   plant_id     # individual/replicate
+  level3:   treatment      # finest grouping (most granular)
 
 scan:
   id_col:   Spec_scan     # unique scan identifier column
   date_col: Datetime          # date column (parsed from scan name by stack.py)
+
+# –– Daily PCA ──────────────────────────────────────────────────────────────────
+daily_pca:
+  grouping: level2
+  
+
 
 # ── PLS-DA ─────────────────────────────────────────────────────────────────────
 plsda:
