@@ -3,7 +3,7 @@ setup(
     name="svc_spectral_analysis",
     version="1.0.0",
     description="Tools for reading and analysing SVC HR-1024 .sig files",
-    author="",
+    author="Nicola Falco (nicolafalco@lbl.gov)",
     packages=find_packages(),
     python_requires=">=3.8",
     # ADD THIS LINE BELOW:
