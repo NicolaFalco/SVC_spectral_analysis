@@ -20,7 +20,6 @@ setup(
     entry_points={
         "console_scripts": [
             "svc-reader=svc_reader.__main__:main",
-            "svc-analysis=svc_analysis.__main__:main",
         ]
     },
     classifiers=[
